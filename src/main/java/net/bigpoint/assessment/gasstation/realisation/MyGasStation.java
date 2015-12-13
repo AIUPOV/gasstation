@@ -18,8 +18,12 @@ public class MyGasStation extends Thread implements GasStation {
 
 	// All GasPumps by Type
 	private Map<GasType, Collection<GasPump>> pumpsMap = new HashMap<GasType, Collection<GasPump>>();
+	
+	// All busy's GasPumps by Type
+	private Map<GasType, Collection<GasPump>> busyPumpsMap = new HashMap<GasType, Collection<GasPump>>();
 
 	private Map<GasType, Double> prices = Collections.synchronizedMap(new HashMap<GasType, Double>());
+
 	private volatile Double revenue = 0.00;
 	private AtomicInteger salesCounter = new AtomicInteger(0);
 	private AtomicInteger noGasCounter = new AtomicInteger(0);
@@ -28,9 +32,10 @@ public class MyGasStation extends Thread implements GasStation {
 	public void addGasPump(GasPump pump) {
 		synchronized (pumpsMap) {
 			if (pumpsMap.get(pump.getGasType()) == null) {
-				Collection<GasPump> list = Collections.synchronizedCollection(new ArrayList<GasPump>());
+				Collection<GasPump> list = new ArrayList<GasPump>();
 				list.add(pump);
 				pumpsMap.put(pump.getGasType(), list);
+				busyPumpsMap.put(pump.getGasType(), new ArrayList<GasPump>());
 			} else {
 				Collection<GasPump> list = pumpsMap.get(pump.getGasType());
 				list.add(pump);
@@ -39,11 +44,17 @@ public class MyGasStation extends Thread implements GasStation {
 		}
 	}
 
-	public Collection<GasPump> getGasPumps() {
+	public synchronized Collection<GasPump> getGasPumps() {
 		List<GasPump> allPumps = new ArrayList<GasPump>();
-		List<Collection<GasPump>> list = new ArrayList<Collection<GasPump>>(pumpsMap.values());
-
-		for (Collection<GasPump> pumps : list) {
+		allPumps.addAll(getPumps(pumpsMap));
+		allPumps.addAll(getPumps(busyPumpsMap));
+		return allPumps;
+	}
+	
+	private Collection<GasPump> getPumps(Map<GasType, Collection<GasPump>> pumpsMap){
+		List<GasPump> allPumps = new ArrayList<GasPump>();
+		List<Collection<GasPump>> pumpsLists = new ArrayList<Collection<GasPump>>(pumpsMap.values());
+		for (Collection<GasPump> pumps : pumpsLists) {
 			allPumps.addAll(pumps);
 		}
 		return allPumps;
@@ -51,62 +62,71 @@ public class MyGasStation extends Thread implements GasStation {
 
 	public double buyGas(GasType type, double amountInLiters, double maxPricePerLiter)
 			throws NotEnoughGasException, GasTooExpensiveException {
-		double price = getPrice(type);
-
-		if (price >= maxPricePerLiter) {
+		double price = getPrice(type);	
+		if (price <= maxPricePerLiter) {
 			if (pumpsMap.containsKey(type)) {
 				// select suitable pump, and remove it from available pumps collection
-				GasPump selectedPump = selectPump(type, amountInLiters);
+				Collection<GasPump> pumps = pumpsMap.get(type);
+				Collection<GasPump> busyPumps = busyPumpsMap.get(type);
+				GasPump selectedPump = selectPump(pumps, busyPumps, type, amountInLiters);
 
 				// pump gas and write statistical data
 				selectedPump.pumpGas(amountInLiters);
-				double resultPrice = getRevenueAndUpdateStats(amountInLiters, price);
-
-				// return pump to available pumps collection, notify awaiting threads
-				Collection<GasPump> pumps = pumpsMap.get(type);
-				synchronized (pumps) {
-					pumps.add(selectedPump);
-					pumpsMap.get(type).notifyAll();
+				
+				double resultPrice;
+				synchronized(this){
+					resultPrice = getRevenueAndUpdateStats(amountInLiters, price);
+					movePump(selectedPump, busyPumps, pumps);
+					notifyAll();
 				}
-
 				return resultPrice;
-			} else{
-				System.err.println("Unknown gas pump type");
-				return 0;
+			} else {
+				throw new NotEnoughGasException();
 			}
 		} else {
 			tooExpensiveCounter.getAndIncrement();
 			throw new GasTooExpensiveException();
 		}
 	}
+	
+	private synchronized void movePump(GasPump pump, Collection<GasPump> from, Collection<GasPump> to){
+		from.remove(pump);
+		to.add(pump);
+	}
 
-	private GasPump selectPump(GasType type, double amountInLiters) throws NotEnoughGasException {
-		Collection<GasPump> pumps = pumpsMap.get(type);
-		GasPump selectedPump = null;
-		synchronized (pumps) {
-			// if there are no free pumps, wait
-			while (pumps.isEmpty()) {
-				try {
-					pumps.wait();
-				} catch (InterruptedException ex) {
-					ex.printStackTrace();
-				}
-			}
-			// chose pump with enough amount of gas
-			for (GasPump pump : pumps) {
-				if (pump.getRemainingAmount() >= amountInLiters) {
-					selectedPump = pump;
-					break;
-				}
-			}
-			if (selectedPump != null) {
-				pumps.remove(selectedPump);
-			} else {
-				noGasCounter.getAndIncrement();
-				throw new NotEnoughGasException();
+	private synchronized GasPump selectPump(Collection<GasPump> pumps, Collection<GasPump> busyPumps, GasType type, double amountInLiters) throws NotEnoughGasException {		
+		GasPump selectedPump = findPumpWithEnoughGas(pumps, amountInLiters);
+		if(selectedPump != null){
+			movePump(selectedPump, pumps, busyPumps);
+			return selectedPump;
+		}
+		
+		selectedPump = findPumpWithEnoughGas(busyPumps, amountInLiters);
+		
+		if(selectedPump == null){
+			noGasCounter.getAndIncrement();
+			throw new NotEnoughGasException();
+		}
+
+		while(!pumps.contains(selectedPump)){
+			try {
+				wait();
+			}catch(InterruptedException ex){
+				ex.printStackTrace();
+			}					
+		}
+		movePump(selectedPump, pumps, busyPumps);
+		return selectedPump;
+	}
+
+	private synchronized GasPump findPumpWithEnoughGas(Collection<GasPump> pumps, double amount) {
+		for(GasPump pump : pumps){
+			double pumpAmount = pump.getRemainingAmount();
+			if(pumpAmount >= amount){
+				return pump;
 			}
 		}
-		return selectedPump;
+		return null;
 	}
 
 	public double getRevenue() {
@@ -141,6 +161,10 @@ public class MyGasStation extends Thread implements GasStation {
 	}
 
 	public double getPrice(GasType type) {
+		Double price = prices.get(type);
+		if (price == null) {
+			throw new RuntimeException("Price for gas type " + type + " is unknown");
+		}
 		return prices.get(type);
 	}
 
